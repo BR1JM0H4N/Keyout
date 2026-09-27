@@ -1,0 +1,611 @@
+name: Build APK v3 (nav preserved)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build type"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # NODE.JS
+      # ============================================================
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+
+      # ============================================================
+      # INSTALL DEPENDENCIES
+      # ============================================================
+      - name: Install dependencies
+        run: npm install
+
+
+      # ============================================================
+      # PREPARE STATIC WEBSITE
+      # ============================================================
+      - name: Prepare web assets
+        run: |
+          rm -rf www
+          mkdir -p www
+
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='android/' \
+            --exclude='ios/' \
+            --exclude='node_modules/' \
+            --exclude='www/' \
+            --exclude='assets-icon/' \
+            --exclude='capacitor.config.*' \
+            --exclude='logo.png' \
+            --exclude='Build-app.yml' \
+            ./ www/
+
+          echo "=========================================="
+          echo "Website files copied to www/"
+          echo "=========================================="
+
+          find www -type f | sort
+
+
+          # --------------------------------------------------------
+          # Capacitor download bridge
+          # --------------------------------------------------------
+          cat > www/capacitor-download-bridge.js << 'SCRIPT_EOF'
+          (function () {
+            if (!window.Capacitor || !window.Capacitor.Plugins) return;
+
+            const { Filesystem } = window.Capacitor.Plugins;
+
+            if (!Filesystem) {
+              console.warn('Filesystem plugin missing');
+              return;
+            }
+
+            function blobUrlToBase64(blobUrl) {
+              return fetch(blobUrl)
+                .then(function (response) {
+                  return response.blob();
+                })
+                .then(function (blob) {
+                  return new Promise(function (resolve, reject) {
+                    const reader = new FileReader();
+
+                    reader.onloadend = function () {
+                      resolve(reader.result.split(',')[1]);
+                    };
+
+                    reader.onerror = reject;
+
+                    reader.readAsDataURL(blob);
+                  });
+                });
+            }
+
+            async function saveAndNotify(base64Data, filename) {
+              try {
+                await Filesystem.writeFile({
+                  path: 'Download/' + filename,
+                  data: base64Data,
+                  directory: 'DOCUMENTS',
+                  recursive: true
+                });
+
+                alert('Saved to Downloads: ' + filename);
+
+              } catch (error) {
+                console.error('Save failed:', error);
+                alert('Failed to save file: ' + error.message);
+              }
+            }
+
+            var originalClick = HTMLAnchorElement.prototype.click;
+
+            HTMLAnchorElement.prototype.click = function () {
+              var href = this.getAttribute('href');
+              var filename = this.getAttribute('download');
+
+              if (
+                href &&
+                href.indexOf('blob:') === 0 &&
+                filename
+              ) {
+                blobUrlToBase64(href)
+                  .then(function (base64) {
+                    saveAndNotify(base64, filename);
+                  });
+
+                return;
+              }
+
+              return originalClick.apply(this, arguments);
+            };
+          })();
+          SCRIPT_EOF
+
+
+      # ============================================================
+      # ADD ANDROID PLATFORM
+      # ============================================================
+      - name: Add Android platform
+        run: npx cap add android
+
+
+      # ============================================================
+      # DYNAMIC COLOR
+      # Material You / Android 12+
+      # ============================================================
+      - name: Inject dynamic color bridge
+        run: |
+
+          # --------------------------------------------------------
+          # 1. Add Material Components dependency
+          # --------------------------------------------------------
+          GRADLE_FILE=android/app/build.gradle
+
+          if [ ! -f "$GRADLE_FILE" ]; then
+            echo "ERROR: $GRADLE_FILE not found."
+            exit 1
+          fi
+
+          if ! grep -q "com.google.android.material:material" "$GRADLE_FILE"; then
+            sed -i \
+              "s#implementation project(':capacitor-android')#implementation project(':capacitor-android')\n    implementation 'com.google.android.material:material:1.12.0'#" \
+              "$GRADLE_FILE"
+
+            echo "Added Material Components dependency."
+          else
+            echo "Material Components dependency already present."
+          fi
+
+
+          # --------------------------------------------------------
+          # 3. Patch MainActivity.java
+          # --------------------------------------------------------
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
+
+          if [ -z "$MAIN_ACTIVITY" ]; then
+            echo "ERROR: MainActivity.java not found."
+            exit 1
+          fi
+
+          PACKAGE_LINE=$(grep '^package ' "$MAIN_ACTIVITY")
+
+          cat > "$MAIN_ACTIVITY" << JAVA_EOF
+          $PACKAGE_LINE
+
+          import android.content.Context;
+          import android.os.Bundle;
+          import android.view.ContextThemeWrapper;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+
+          import com.getcapacitor.BridgeActivity;
+          import com.google.android.material.color.DynamicColors;
+          import com.google.android.material.color.MaterialColors;
+          import com.google.android.material.R;
+
+          public class MainActivity extends BridgeActivity {
+              private Context dynamicColorContext;
+
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+
+                  super.onCreate(savedInstanceState);
+
+                  Context materialContext =
+                      new ContextThemeWrapper(
+                          this,
+                          R.style.Theme_Material3_DayNight_NoActionBar
+                      );
+
+                  /*
+                   * Apply Android 12+ dynamic colors ONLY to this
+                   * temporary palette context.
+                   */
+                  dynamicColorContext =
+                      DynamicColors.wrapContextIfAvailable(
+                          materialContext
+                      );
+
+
+                  /*
+                   * Expose the resolved Material palette to JavaScript.
+                   */
+                  WebView webView = bridge.getWebView();
+
+                  webView.addJavascriptInterface(
+                      new DynamicColorJavascriptInterface(),
+                      "DynamicColorBridge"
+                  );
+              }
+
+
+              private class DynamicColorJavascriptInterface {
+
+                  @JavascriptInterface
+                  public String getPalette() {
+                      return buildPaletteJson();
+                  }
+              }
+
+
+              /*
+               * Resolve colors from the isolated dynamic Material
+               * context rather than the Activity.
+               */
+              private int resolveColor(int attr, int fallback) {
+
+                  return MaterialColors.getColor(
+                      dynamicColorContext,
+                      attr,
+                      fallback
+                  );
+              }
+
+
+              private String hex(int color) {
+
+                  return String.format(
+                      "#%06X",
+                      0xFFFFFF & color
+                  );
+              }
+
+
+              private String buildPaletteJson() {
+
+                  int[][] palette = {
+
+                      { R.attr.colorPrimary,                 0 },
+                      { R.attr.colorOnPrimary,               0 },
+                      { R.attr.colorPrimaryContainer,       0 },
+                      { R.attr.colorOnPrimaryContainer,     0 },
+
+                      { R.attr.colorSecondary,               0 },
+                      { R.attr.colorOnSecondary,             0 },
+                      { R.attr.colorSecondaryContainer,      0 },
+                      { R.attr.colorOnSecondaryContainer,    0 },
+
+                      { R.attr.colorTertiary,                 0 },
+                      { R.attr.colorOnTertiary,               0 },
+                      { R.attr.colorTertiaryContainer,       0 },
+                      { R.attr.colorOnTertiaryContainer,     0 },
+
+                      { R.attr.colorError,                    0 },
+                      { R.attr.colorOnError,                  0 },
+                      { R.attr.colorErrorContainer,           0 },
+                      { R.attr.colorOnErrorContainer,         0 },
+
+                      { R.attr.colorSurface,                  0 },
+                      { R.attr.colorOnSurface,                0 },
+                      { R.attr.colorSurfaceVariant,          0 },
+                      { R.attr.colorOnSurfaceVariant,        0 },
+
+                      { R.attr.colorSurfaceContainerLowest,   0 },
+                      { R.attr.colorSurfaceContainerLow,     0 },
+                      { R.attr.colorSurfaceContainer,         0 },
+                      { R.attr.colorSurfaceContainerHigh,    0 },
+                      { R.attr.colorSurfaceContainerHighest, 0 },
+
+                      { R.attr.colorSurfaceDim,               0 },
+                      { R.attr.colorSurfaceBright,            0 },
+
+                      { R.attr.colorOutline,                  0 },
+                      { R.attr.colorOutlineVariant,           0 }
+                  };
+
+
+                  String[] keys = {
+
+                      "primary",
+                      "onPrimary",
+                      "primaryContainer",
+                      "onPrimaryContainer",
+
+                      "secondary",
+                      "onSecondary",
+                      "secondaryContainer",
+                      "onSecondaryContainer",
+
+                      "tertiary",
+                      "onTertiary",
+                      "tertiaryContainer",
+                      "onTertiaryContainer",
+
+                      "error",
+                      "onError",
+                      "errorContainer",
+                      "onErrorContainer",
+
+                      "surface",
+                      "onSurface",
+                      "surfaceVariant",
+                      "onSurfaceVariant",
+
+                      "surfaceContainerLowest",
+                      "surfaceContainerLow",
+                      "surfaceContainer",
+                      "surfaceContainerHigh",
+                      "surfaceContainerHighest",
+
+                      "surfaceDim",
+                      "surfaceBright",
+
+                      "outline",
+                      "outlineVariant"
+                  };
+
+
+                  StringBuilder sb =
+                      new StringBuilder("{");
+
+
+                  for (int i = 0; i < palette.length; i++) {
+
+                      int color = resolveColor(
+                          palette[i][0],
+                          0xFF6750A4
+                      );
+
+
+                      sb.append("\"")
+                        .append(keys[i])
+                        .append("\":\"")
+                        .append(hex(color))
+                        .append("\"");
+
+
+                      if (i < palette.length - 1) {
+                          sb.append(",");
+                      }
+                  }
+
+
+                  sb.append("}");
+
+                  return sb.toString();
+              }
+          }
+          JAVA_EOF
+
+
+          echo "=========================================="
+          echo "MainActivity.java patched"
+          echo "=========================================="
+
+          cat "$MAIN_ACTIVITY"
+
+
+          # --------------------------------------------------------
+          # 4. Create dynamic color JavaScript bridge
+          #
+          # Loaded in <head>, and pulls the palette directly from
+          # the Android JavascriptInterface.
+          # --------------------------------------------------------
+          cat > www/dynamic-color-bridge.js << 'SCRIPT_EOF'
+          (function () {
+
+            function apply(palette) {
+              if (!palette) return;
+
+              window.__dynamicColors = palette;
+
+              Object.entries(palette).forEach(function (entry) {
+                document.documentElement.style.setProperty(
+                  '--md-' + entry[0],
+                  entry[1]
+                );
+              });
+
+              document.documentElement.classList.add(
+                'dynamic-colors-ready'
+              );
+
+              document.dispatchEvent(
+                new CustomEvent('dynamic-colors-ready', {
+                  detail: palette
+                })
+              );
+            }
+
+
+            function loadDynamicColors() {
+
+              if (
+                window.DynamicColorBridge &&
+                typeof window.DynamicColorBridge.getPalette === 'function'
+              ) {
+
+                try {
+
+                  var json =
+                    window.DynamicColorBridge.getPalette();
+
+                  if (json) {
+                    apply(JSON.parse(json));
+                    return true;
+                  }
+
+                } catch (error) {
+
+                  console.error(
+                    'Dynamic color bridge failed:',
+                    error
+                  );
+                }
+              }
+
+              return false;
+            }
+
+
+            // Try immediately.
+            if (!loadDynamicColors()) {
+
+              // Defensive retry during WebView initialization.
+              var attempts = 0;
+
+              var timer = setInterval(function () {
+
+                attempts++;
+
+                if (
+                  loadDynamicColors() ||
+                  attempts >= 100
+                ) {
+                  clearInterval(timer);
+                }
+
+              }, 20);
+            }
+
+          })();
+          SCRIPT_EOF
+
+
+          # --------------------------------------------------------
+          # 5. Inject dynamic color bridge into HEAD
+          # --------------------------------------------------------
+          if [ -f www/index.html ]; then
+
+          sed -i \
+          's#</head>#<script src="capacitor-download-bridge.js"></script><script src="dynamic-color-bridge.js"></script></head>#' \
+                www/index.html
+
+          else
+            echo "ERROR: index.html not found."
+            exit 1
+          fi
+
+
+      # ============================================================
+      # STORAGE PERMISSION
+      # ============================================================
+      - name: Add storage permission
+        run: |
+          sed -i \
+            '/<manifest /a\    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />' \
+            android/app/src/main/AndroidManifest.xml
+
+
+      # ============================================================
+      # PREPARE APP ICON
+      # ============================================================
+      - name: Prepare app icon
+        run: |
+
+          if [ ! -f logo.png ]; then
+            echo "ERROR: logo.png was not found in repository root."
+            echo ""
+            echo "Please add your finished HD app icon as:"
+            echo "    logo.png"
+            exit 1
+          fi
+
+          mkdir -p assets-icon
+
+          cp logo.png assets-icon/logo.png
+
+          echo "=========================================="
+          echo "App icon:"
+          echo "=========================================="
+
+          file assets-icon/logo.png
+
+
+      # ============================================================
+      # INSTALL CAPACITOR ASSETS
+      # ============================================================
+      - name: Install Capacitor Assets
+        run: |
+          npm install --save-dev @capacitor/assets
+
+
+      # ============================================================
+      # GENERATE ANDROID ICONS
+      # ============================================================
+      - name: Generate Android icons
+        run: |
+          npx @capacitor/assets generate \
+            --android \
+            --assetPath assets-icon \
+            --iconBackgroundColor "#FFFFFF" \
+            --iconBackgroundColorDark "#111111"
+
+
+      # ============================================================
+      # SYNC CAPACITOR
+      # ============================================================
+      - name: Sync Android project
+        run: |
+          npx cap sync android
+
+
+      # ============================================================
+      # JAVA 21
+      # ============================================================
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+
+      # ============================================================
+      # BUILD DEBUG APK
+      # ============================================================
+      - name: Build debug APK
+        if: ${{ inputs.build_type == 'debug' }}
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+
+      # ============================================================
+      # BUILD RELEASE APK
+      # ============================================================
+      - name: Build release APK
+        if: ${{ inputs.build_type == 'release' }}
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+
+      # ============================================================
+      # UPLOAD APK
+      # ============================================================
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+          if-no-files-found: ignore
